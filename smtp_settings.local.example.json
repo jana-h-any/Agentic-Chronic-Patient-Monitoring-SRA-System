@@ -1,0 +1,9 @@
+{
+  "smtp_host": "smtp.gmail.com",
+  "smtp_port": 587,
+  "smtp_security": "STARTTLS",
+  "smtp_username": "your-real-sender@gmail.com",
+  "smtp_password": "your-app-password",
+  "sender_email": "your-real-sender@gmail.com",
+  "recipient_email": ""
+}

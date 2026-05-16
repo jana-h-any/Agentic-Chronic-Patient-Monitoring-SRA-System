@@ -1,0 +1,4 @@
+__pycache__/
+*.py[cod]
+streamlit*.log
+smtp_settings.local.json

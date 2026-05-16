@@ -1,0 +1,6 @@
+{"agent": "VitalsAgent", "decision": "Vitals analysis: Critical=True", "timestamp": "2026-05-16T00:23:38.563769"}
+{"agent": "RiskAgent", "decision": "Risk assessment: risk_score=0.21", "timestamp": "2026-05-16T00:23:38.565767"}
+{"agent": "AlertAgent", "decision": "Alert configuration updated: threshold=0.95 (FPR=0.07)", "timestamp": "2026-05-16T00:23:38.570768"}
+{"agent": "VitalsAgent", "decision": "Vitals analysis: Critical=True", "timestamp": "2026-05-16T00:38:57.515020"}
+{"agent": "RiskAgent", "decision": "Risk assessment: risk_score=0.21", "timestamp": "2026-05-16T00:38:57.520014"}
+{"agent": "AlertAgent", "decision": "Alert configuration updated: threshold=0.95 (FPR=0.07)", "timestamp": "2026-05-16T00:38:57.527918"}

@@ -1,0 +1,13 @@
+data:
+  primary_csv: "./data/eicu_real_cohort.csv"
+model:
+  dbscan_eps: 0.5
+  dbscan_min_samples: 5
+  svm_predict_window: 24
+  ensemble_predict_window: 12
+logging:
+  agent_log: "logs/agent_decisions.json"
+  adaptation_log: "logs/adaptations.json"
+  weight_log: "logs/weights.json"
+  dispatch_log: "logs/action_dispatch.json"
+  react_audit_log: "logs/react_audit.json"
