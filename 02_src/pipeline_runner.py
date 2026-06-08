@@ -848,6 +848,155 @@ def _run_monitoring_layers_for_manual_input(
         enriched["prob_critical"] = 0.0
     return enriched
 
+def predict_from_dataframe(
+    pipeline_results: dict,
+    df: pd.DataFrame,
+    patient_id: Optional[str] = None,
+) -> dict:
+    """Run prediction on real multi-hour patient data from a CSV upload.
+
+    Unlike predict_manual_case (which repeats one snapshot), this uses
+    actual varying readings across multiple real hours.
+
+    Parameters
+    ----------
+    pipeline_results : dict
+        Result dict returned by run_pipeline().
+    df : pd.DataFrame
+        Must contain the 8 BASE_FEATURES columns.
+        Optional: 'patient_id', 'hour' (auto-generated 0,1,2... if absent).
+    patient_id : str, optional
+        Override or fallback when df has no patient_id column.
+
+    Returns
+    -------
+    dict
+        {"raw_input": dict, "timeline": pd.DataFrame, "latest_prediction": dict}
+        Same structure as predict_manual_case().
+    """
+    if not pipeline_results:
+        raise ValueError("Pipeline results are required before CSV prediction.")
+
+    config = pipeline_results["config"]
+    ensemble_model = pipeline_results["ensemble_model"]
+    svm_model = pipeline_results["svm_model"]
+    feature_columns = list(pipeline_results["feature_columns"])
+    threshold = float(pipeline_results["metrics"]["threshold_last"])
+    fcm_artifact = pipeline_results.get("fcm_artifact")
+    shap_store = pipeline_results.get("shap_store", {})
+    cluster_trends = pipeline_results.get("cluster_trends", {})
+    decision_context = dict(pipeline_results.get("decision_context", {}))
+    audit_path = pipeline_results.get("paths", {}).get("react_audit_log")
+
+    min_samples = int(config["model"]["dbscan_min_samples"])
+    eps = float(config["model"]["dbscan_eps"])
+
+    # ── Build manual_raw from the uploaded DataFrame ──────────────────────────
+    manual_raw = df.copy()
+
+    pid = patient_id or "csv_case"
+    if "patient_id" not in manual_raw.columns:
+        manual_raw["patient_id"] = pid
+    elif patient_id:
+        manual_raw["patient_id"] = patient_id   # allow caller to override
+
+    if "hour" not in manual_raw.columns:
+        manual_raw["hour"] = range(len(manual_raw))
+
+    # Labels are unknown for live input — set to 0
+    manual_raw["deterioration_12h"] = 0
+    manual_raw["deterioration_24h"] = 0
+
+    # Ensure all BASE_FEATURES present (fill with 0 if a column is missing)
+    for feat in BASE_FEATURES:
+        if feat not in manual_raw.columns:
+            manual_raw[feat] = 0.0
+
+    manual_raw = manual_raw.sort_values("hour").reset_index(drop=True)
+
+    # ── Downstream pipeline — identical to predict_manual_case ────────────────
+    manual_processed = preprocess_data(manual_raw.copy())
+    manual_processed = _run_monitoring_layers_for_manual_input(
+        manual_processed,
+        eps=eps,
+        min_samples=min_samples,
+        fcm_artifact=fcm_artifact,
+    )
+
+    for column in feature_columns:
+        if column not in manual_processed.columns:
+            manual_processed[column] = 0.0
+
+    X_manual = manual_processed[feature_columns].fillna(0)
+    manual_processed["future_risk"] = ensemble_model.predict_proba(X_manual)[:, 1]
+    manual_processed["dynamic_weight"] = 1 + manual_processed["future_risk"] * 5
+    manual_processed["svm_prob_24h"] = svm_model.predict_proba(X_manual)[:, 1]
+    manual_processed["svm_pred_24h"] = (manual_processed["svm_prob_24h"] >= threshold).astype(int)
+    manual_processed["threshold_last"] = threshold
+    manual_processed["source_index"] = None
+
+    shap_vectors = []
+    for _, row in manual_processed.iterrows():
+        cluster_id = int(row.get("fcm_cluster", 0) or 0)
+        base_vector = np.asarray(
+            shap_store.get("cluster_means", {}).get(cluster_id, np.zeros(len(feature_columns))),
+            dtype=float,
+        )
+        if base_vector.size != len(feature_columns):
+            base_vector = np.zeros(len(feature_columns), dtype=float)
+        shap_vectors.append(base_vector)
+
+    manual_processed["shap_vector"] = shap_vectors
+    manual_processed["arima_trend_multiplier"] = manual_processed["fcm_cluster"].astype(int).map(
+        lambda cid: cluster_trends.get(int(cid), {"multiplier": 1.0})["multiplier"]
+    )
+
+    latest_row = manual_processed.iloc[-1].to_dict()
+    state_payload = derive_patient_state(latest_row, threshold)
+    latest_row.update(state_payload)
+
+    actual_pid = str(latest_row.get("patient_id", pid))
+
+    if decision_context:
+        react_result = run_react_inner_loop(
+            latest_row,
+            decision_context,
+            audit_path=audit_path,
+            case_label=f"csv_{actual_pid}",
+        )
+        latest_row["react_route"] = react_result["route"]
+        latest_row["intelligent_score"] = react_result["score"]["intelligent_score"]
+        latest_row["shap_cosine"] = react_result["score"]["shap_cosine"]
+        latest_row["dominant_feature"] = react_result["dominant_feature"]["name"]
+        latest_row["dispatch_action"] = react_result["action"]["action_type"]
+        latest_row["alert_reason"] = react_result["action"]["explanation"]
+        latest_row["action_timing_minutes"] = react_result["action"]["timing_minutes"]
+        latest_row["action_intensity"] = react_result["action"]["intensity"]
+        latest_row["action_personalisation"] = react_result["action"]["personalisation"]
+        latest_row["react_trace"] = react_result["react_trace"]
+
+    latest_row["patient_id"] = actual_pid
+    latest_row["hour"] = int(latest_row["hour"])
+    latest_row["future_risk"] = float(latest_row["future_risk"])
+    latest_row["svm_prob_24h"] = float(latest_row["svm_prob_24h"])
+    latest_row["threshold_last"] = threshold
+    latest_row["prob_stable"] = float(latest_row.get("prob_stable", 0.0))
+    latest_row["prob_warning"] = float(latest_row.get("prob_warning", 0.0))
+    latest_row["prob_critical"] = float(latest_row.get("prob_critical", 0.0))
+    latest_row["anomaly_flag"] = int(latest_row.get("anomaly_flag", 0))
+    latest_row["dynamic_weight"] = float(latest_row.get("dynamic_weight", 1.0))
+    latest_row["display_status"] = latest_row["binary_status"]
+
+    last_real_row = manual_raw.iloc[-1]
+    raw_input = {feat: float(last_real_row.get(feat, 0.0)) for feat in BASE_FEATURES}
+
+    return {
+        "raw_input": raw_input,
+        "timeline": manual_processed[
+            ["hour", "future_risk", "svm_prob_24h", "prob_stable", "prob_warning", "prob_critical", "anomaly_flag"]
+        ].copy(),
+        "latest_prediction": latest_row,
+    }
 
 def predict_manual_case(
     pipeline_results: dict,

@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import smtplib
 import ssl
@@ -7,8 +8,12 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import requests
 
 from utils import log_to_json
+
+logger = logging.getLogger(__name__)
+LAST_GEMINI_ERROR: str | None = None
 
 STATUS_PRIORITY = {"Critical": 0, "Warning": 1, "Stable": 2}
 SMTP_SETTINGS_PATH = Path(__file__).resolve().parents[1] / "smtp_settings.local.json"
@@ -156,7 +161,7 @@ def run_react_inner_loop(
     cfg = {**REACT_DEFAULTS, **context.get("react", {})}
     score_payload = compute_intelligent_score(record, context)
     dominant = _dominant_feature(record, context)
-    route = "confidence_too_low_human_review"
+    route = "confidence_too_low"
     rag_payload = None
 
     score = float(score_payload["intelligent_score"])
@@ -300,6 +305,7 @@ def run_react_inner_loop(
         )
 
     else:
+
         route = "confidence_too_low_human_review"
         reason = "Score is above the minimum but not reliable enough for autonomous dispatch."
         observations.append(
@@ -395,15 +401,130 @@ def derive_patient_state(record: dict[str, Any], threshold: float) -> dict[str, 
 
     return {
         "clinical_state": state,
-        "binary_status": "Dangerous Situation" if state != "Stable" else "Normal",
+       # NEW — three distinct statuses
+        "binary_status": {"Stable": "Normal", "Warning": "Warning", "Critical": "Dangerous Situation"}.get(state, "Unknown"),
         "dispatch_action": action_label,
         "dispatch_priority": STATUS_PRIORITY[state],
         "alert_reason": "; ".join(reasons),
         "is_actionable": state != "Stable",
     }
 
-def build_email_payload(record: dict[str, str]) -> dict[str, str]:
+# NEW
+def _get_gemini_api_key() -> str:
+    """Read Gemini API key: env var first, then saved JSON settings file."""
+    key = (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY") or "").strip()
+    if key:
+        return key
+    # Fallback: read from smtp_settings.local.json (handles Streamlit restarts)
+    try:
+        if SMTP_SETTINGS_PATH.exists():
+            with open(SMTP_SETTINGS_PATH, "r", encoding="utf-8") as _fh:
+                key = json.load(_fh).get("gemini_api_key", "").strip()
+    except Exception:
+        pass
+    return key
 
+def _generate_gemini_text(prompt: str, system_prompt: str, model: str = "gemini-2.5-flash") -> str:
+    """Generate text with Gemini using the native REST API."""
+    api_key = _get_gemini_api_key()
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY is not set.")
+
+    response = requests.post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+        headers={"x-goog-api-key": api_key},
+        json={
+            "systemInstruction": {"parts": [{"text": system_prompt}]},
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.3},
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+
+    payload = response.json()
+    candidates = payload.get("candidates", [])
+    if not candidates:
+        raise RuntimeError(f"Gemini returned no candidates: {payload}")
+
+    parts = candidates[0].get("content", {}).get("parts", [])
+    text = "".join(str(part.get("text", "")) for part in parts).strip()
+    if not text:
+        raise RuntimeError(f"Gemini returned an empty response: {payload}")
+
+    return text
+
+
+def generate_professional_email(record: dict[str, Any]) -> str | None:
+    """Use Gemini to write a professional medical alert email body from SHAP results.
+
+    Returns None if Gemini is unavailable so build_email_payload can fall back
+    to the static template.
+    """
+    global LAST_GEMINI_ERROR
+    LAST_GEMINI_ERROR = None
+
+    if not _get_gemini_api_key():
+        LAST_GEMINI_ERROR = "GEMINI_API_KEY is not set in this Streamlit/Python process."
+        logger.info("GEMINI_API_KEY is not set; using static email template.")
+        return None
+
+    state = str(record.get("clinical_state", "Unknown"))
+    binary_status = str(record.get("binary_status", "Unknown"))
+    patient_id = str(record.get("patient_id", "N/A"))
+    hour = str(record.get("hour", "N/A"))
+    future_risk = float(record.get("future_risk", 0.0) or 0.0)
+    svm_prob = float(record.get("svm_prob_24h", 0.0) or 0.0)
+    reason = str(record.get("alert_reason", "No reason available"))
+    action_label = str(record.get("dispatch_action", "Review dashboard"))
+
+    # SHAP-specific context
+    dominant = record.get("dominant_feature", {})
+    dominant_name = dominant.get("name", "overall physiology") if isinstance(dominant, dict) else "overall physiology"
+    dominant_value = dominant.get("value", 0.0) if isinstance(dominant, dict) else 0.0
+    top_features = record.get("top_features", [])
+    shap_cosine = float(record.get("shap_cosine", 0.0) or 0.0)
+    intelligent_score = float(record.get("intelligent_score", 0.0) or 0.0)
+
+    prompt = (
+        "You are a clinical alert notification system. "
+        "Write a formal, professional medical alert email body for the healthcare team. "
+        "Do NOT include a subject line - only the email body.\n\n"
+        f"Patient ID: {patient_id}\n"
+        f"Monitoring Hour: {hour}\n"
+        f"Clinical State: {state} - {binary_status}\n"
+        f"Recommended Action: {action_label}\n"
+        f"12h Future Risk Score: {future_risk:.3f}\n"
+        f"24h SVM Deterioration Score: {svm_prob:.3f}\n"
+        f"Alert Reason: {reason}\n\n"
+        f"SHAP Analysis Results:\n"
+        f"  Dominant Risk Driver: {dominant_name} (SHAP value: {dominant_value:.4f})\n"
+        f"  Top Contributing Features: {', '.join(top_features) if top_features else 'N/A'}\n"
+        f"  SHAP Reliability (cosine alignment): {shap_cosine:.3f}\n"
+        f"  Composite Intelligent Risk Score: {intelligent_score:.4f}\n\n"
+        "Write 3-4 concise paragraphs:\n"
+        "1. Opening with urgency level and patient identification\n"
+        "2. Clinical interpretation of the SHAP analysis - which physiological parameters "
+        "are driving the risk and why they matter\n"
+        "3. Specific recommended clinical actions based on the scores\n"
+        "4. Closing with monitoring instructions and follow-up guidance\n\n"
+        "Use formal medical language. Be precise and actionable."
+    )
+
+    try:
+        return _generate_gemini_text(
+            prompt=prompt,
+            system_prompt=(
+                "You are a clinical decision support system generating "
+                "formal medical alert notifications for ICU and ward staff."
+            ),
+        )
+    except Exception as exc:
+        LAST_GEMINI_ERROR = str(exc)
+        logger.warning("Gemini email body generation failed: %s", exc)
+        return None  # Fall back to static template
+
+def build_email_payload(record: dict[str, Any]) -> dict[str, str]:
     state = str(record.get("clinical_state", "Unknown"))
 
     if record.get("binary_status"):
@@ -417,51 +538,77 @@ def build_email_payload(record: dict[str, str]) -> dict[str, str]:
 
     patient_id = str(record.get("patient_id", "N/A"))
     hour = str(record.get("hour", "N/A"))
-
     future_risk = float(record.get("future_risk", 0.0) or 0.0)
     svm_prob = float(record.get("svm_prob_24h", 0.0) or 0.0)
-
     reason = str(record.get("alert_reason", "No reason available"))
     action_label = str(record.get("dispatch_action", "Review dashboard"))
 
     subject = f"[Patient Monitor] {binary_status} for patient {patient_id}"
 
-    body = f"""
+    # Try Gemini first for a professional, SHAP-informed email body
+    gemini_body = generate_professional_email({**record, "binary_status": binary_status})
+
+    gemini_used = bool(gemini_body)
+    if gemini_body:
+        body = gemini_body
+    else:
+        # Fallback: original static template
+        body = f"""
 ====================================
+
 ZONE 3 ACTION DISPATCH
+
 ====================================
+
 
 DISPATCH STATE:
+
 {binary_status}
 
+
 Clinical State:
+
 {state}
 
+
 Recommended Action:
+
 {action_label}
 
+
 ------------------------------------
+
 
 Patient ID: {patient_id}
 Hour: {hour}
 
+
 12h Future Risk: {future_risk:.3f}
 
+
 24h Deterioration Score:
+
 {svm_prob:.3f}
 
+
 Reason:
+
 {reason}
 
 ====================================
+
 Generated by Chronic Patient
 Monitoring Dashboard
+
 ====================================
+
 """
 
     return {
         "subject": subject,
         "body": body,
+        "gemini_used": str(gemini_used),
+        "gemini_error": "" if gemini_used else (LAST_GEMINI_ERROR or "Gemini returned no body."),
     }
 
 def get_provider_preset(provider_name: str) -> dict[str, Any]:
@@ -495,6 +642,7 @@ def load_smtp_settings(defaults: dict[str, Any] | None = None) -> dict[str, Any]
         "smtp_password": os.getenv("SMTP_PASSWORD"),
         "sender_email": os.getenv("SENDER_EMAIL"),
         "recipient_email": os.getenv("RECIPIENT_EMAIL"),
+        "gemini_api_key": os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY"),
     }
     for key, value in env_overrides.items():
         if value not in (None, ""):
@@ -507,6 +655,7 @@ def load_smtp_settings(defaults: dict[str, Any] | None = None) -> dict[str, Any]
     settings.setdefault("smtp_password", "")
     settings.setdefault("sender_email", "")
     settings.setdefault("recipient_email", "")
+    settings.setdefault("gemini_api_key", "")
     settings["email_provider"] = detect_provider_name(str(settings.get("smtp_host", "")))
     return settings
 
@@ -520,6 +669,7 @@ def save_smtp_settings(settings: dict[str, Any]) -> str:
         "smtp_password": str(settings.get("smtp_password", "")).strip(),
         "sender_email": str(settings.get("sender_email", "")).strip(),
         "recipient_email": str(settings.get("recipient_email", "")).strip(),
+        "gemini_api_key": str(settings.get("gemini_api_key", "")).strip(),
     }
     with open(SMTP_SETTINGS_PATH, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
@@ -559,6 +709,7 @@ def build_smtp_settings_from_state(source: dict[str, Any]) -> dict[str, Any]:
         "smtp_password": str(source.get("smtp_password", "")).strip(),
         "sender_email": str(source.get("sender_email", "")).strip(),
         "recipient_email": str(source.get("recipient_email", "")).strip(),
+        "gemini_api_key": str(source.get("gemini_api_key", "")).strip(),
     }
 
 
