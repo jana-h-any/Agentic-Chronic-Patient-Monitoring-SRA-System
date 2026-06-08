@@ -2,12 +2,6 @@
 
 > **Autonomous AI system for early detection of ICU patient deterioration using Agentic AI, ReAct reasoning, RAG memory, and self-retraining.**
 
-![Python](https://img.shields.io/badge/Python-3.10+-blue)
-![FastAPI](https://img.shields.io/badge/FastAPI-API-green)
-![Streamlit](https://img.shields.io/badge/Streamlit-Dashboard-red)
-![Gemini](https://img.shields.io/badge/Gemini-LLM-orange)
-![Status](https://img.shields.io/badge/Status-Agentic%20System-success)
-
 ---
 
 # Overview
